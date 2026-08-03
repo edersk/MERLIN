@@ -165,10 +165,6 @@ used to qualify the major call
 suggested range: a **higher** threshold is more specific (fewer, higher-
 confidence calls); a **lower** threshold is more sensitivea with possible false-positive calls. 
 
-## Notes
-
-- `vmatchPattern2()` relies on non-exported Biostrings C helpers (via `:::`),
-  which produces NOTEs in `R CMD check`. 
 
 ## License
 
