@@ -49,10 +49,6 @@ Point the pipeline at your own FASTQ and cell-barcode whitelist:
 ```r
 library(MERLIN)
 
-fastq    <- "path/to/reads.fastq.gz"   # Nanopore long reads
-barcodes <- "path/to/barcodes.csv"     # cell-barcode whitelist (10x -1 suffix OK)
-outdir   <- tempfile("merlin_"); dir.create(outdir)
-
 # Step 1: detect SNVs from FASTQ
 detect_snv(
     session_name       = "experiment_name",
