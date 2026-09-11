@@ -15,40 +15,32 @@ vmatchPattern2(
 )
 }
 \arguments{
-\item{pattern}{A \code{\link[Biostrings]{DNAString}} (or coercible string)
-pattern to search for.}
+\item{pattern}{A \code{\link[Biostrings]{DNAString}} pattern to search for.}
 
-\item{subject}{An \code{\link[Biostrings]{XStringSet}} or character vector of
-sequences to search within.}
+\item{subject}{An \code{\link[Biostrings]{XStringSet}} or character string.}
 
-\item{max.mismatch, min.mismatch}{Maximum and minimum number of mismatching
-letters allowed (defaults: 0 and 0).}
+\item{max.mismatch}{Maximum number of mismatching letters allowed (default: 0).}
 
-\item{with.indels}{If \code{TRUE}, insertions and deletions are allowed
-(default: \code{FALSE}).}
+\item{min.mismatch}{Minimum number of mismatching letters allowed (default: 0).}
 
-\item{fixed}{If \code{TRUE} (the default), an IUPAC ambiguity code in the
-pattern can only match the same code in the subject, and vice versa.}
+\item{with.indels}{If TRUE, indels are allowed (default: FALSE).}
 
-\item{algorithm}{One of \code{"auto"}, \code{"naive-exact"},
-\code{"naive-inexact"}, \code{"boyer-moore"}, \code{"shift-or"} or
-\code{"indels"} (default: \code{"auto"}).}
+\item{fixed}{If TRUE, IUPAC ambiguity codes match only themselves (default: TRUE).}
+
+\item{algorithm}{Algorithm to use: "auto", "naive-exact", "naive-inexact",
+"boyer-moore", "shift-or", or "indels" (default: "auto").}
 }
 \value{
-A list of \code{\link[IRanges]{IRanges}} objects, one per subject
-sequence, giving the start/width of every match.
+A list of \code{\link[IRanges]{IRanges}} objects, one per subject sequence,
+indicating match positions.
+
+Originally provided by Herve Pages on
+\url{https://support.bioconductor.org/p/58350/}.
 }
 \description{
-Finds all occurrences (matches/hits) of a pattern in a set of subject
-sequences, supporting mismatches and indels. This is an extended version of
-\code{Biostrings::vmatchPattern} that takes insertions and deletions into
-account, originally provided by Herve Pages on the Bioconductor support site.
-}
-\details{
-The function calls internal Biostrings C code via \code{:::}. Because it
-relies on non-exported functions it is intended for GitHub-only distribution
-and produces NOTEs in \code{R CMD check}. See
-\url{https://support.bioconductor.org/p/58350/} for the original discussion.
+Finds all occurrences of a pattern in a set of subject sequences,
+supporting mismatches and indels. Extended version of
+\code{Biostrings::vmatchPattern} provided by Herve Pages.
 }
 \examples{
 library(Biostrings)

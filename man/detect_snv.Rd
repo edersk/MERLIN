@@ -2,7 +2,7 @@
 % Please edit documentation in R/detect_snv.R
 \name{detect_snv}
 \alias{detect_snv}
-\title{Detect SNVs in single-cell long-read sequencing reads}
+\title{Detect SNVs in Nanopore long-read scRNA-seq data}
 \usage{
 detect_snv(
   session_name,
@@ -25,68 +25,88 @@ detect_snv(
   len_CBC = 16,
   len_UMI = 12,
   n_cores,
-  n_reads_per_chunk = 1e+05
+  n_reads_per_chunk = 1e+05,
+  enriched = FALSE
 )
 }
 \arguments{
-\item{session_name}{Prefix used for output files.}
+\item{session_name}{Character. Prefix for output files.}
 
-\item{path_input_file}{Path to a single FASTQ file (\code{.fastq} or
-\code{.fastq.gz}).}
+\item{path_input_file}{Character. Path to FASTQ file (.fastq or .fastq.gz).}
 
-\item{path_output_folder}{Existing directory to write output files into.}
+\item{path_output_folder}{Character. Directory for output files.}
 
-\item{read1_seq}{Adapter/Read 1 sequence that precedes the cell barcode.}
+\item{read1_seq}{Character. Adapter sequence before the barcode.}
 
-\item{read1_mismatch}{Allowed mismatches when matching \code{read1_seq}.}
+\item{read1_mismatch}{Integer. Allowed mismatches in adapter detection.}
 
-\item{read1_within_range}{Size of the read-start window searched for the
-adapter (default: 70).}
+\item{read1_within_range}{Integer. Search window from read start (default: 70).}
 
-\item{polyN_base}{Nucleotide of the tail to require (default: "T").}
+\item{polyN_base}{Character. Base for poly-N detection (default: "T").}
 
-\item{polyN_length}{Required poly(N) run length (default: 10).}
+\item{polyN_length}{Integer. Required poly-N length (default: 10).}
 
-\item{polyN_mismatch}{Mismatches tolerated within the poly(N) run (default: 2).}
+\item{polyN_mismatch}{Integer. Allowed mismatches in poly-N (default: 2).}
 
-\item{major_roi_seq}{ROI sequence with a single \code{N} at the major SNV
-position.}
+\item{major_roi_seq}{Character. ROI sequence with 'N' at mutation position.}
 
-\item{major_roi_mismatch}{Allowed mismatches when matching \code{major_roi_seq}.}
+\item{major_roi_mismatch}{Integer. Allowed mismatches for major ROI.}
 
-\item{major_roi_mut}{Base that denotes the mutation in the major ROI
-(optional; enables MUT/WT labelling).}
+\item{major_roi_mut}{Character or NULL. Base representing mutation (e.g. "T").}
 
-\item{major_roi_wt}{Base that denotes wild-type in the major ROI (optional).}
+\item{major_roi_wt}{Character or NULL. Base representing wild-type (e.g. "A").}
 
-\item{minor_roi_seq}{ROI sequence with a single \code{N} at a SNP position
-used for phasing (optional).}
+\item{minor_roi_seq}{Character or NULL. Secondary ROI for SNP phasing.}
 
-\item{minor_roi_mismatch}{Allowed mismatches for \code{minor_roi_seq} (optional).}
+\item{minor_roi_mismatch}{Integer or NULL. Mismatches for minor ROI.}
 
-\item{minor_roi_mut}{Base that denotes the mutation in the minor ROI (optional).}
+\item{minor_roi_mut}{Character or NULL. Minor ROI mutation base.}
 
-\item{minor_roi_wt}{Base that denotes wild-type in the minor ROI (optional).}
+\item{minor_roi_wt}{Character or NULL. Minor ROI wild-type base.}
 
-\item{len_CBC}{Cell barcode length (default: 16).}
+\item{len_CBC}{Integer. Cell barcode length (default: 16).}
 
-\item{len_UMI}{UMI length (default: 12).}
+\item{len_UMI}{Integer. UMI length (default: 12).}
 
-\item{n_cores}{Number of CPU cores for the parallel alignment step.}
+\item{n_cores}{Integer. CPU cores for parallel processing.}
 
-\item{n_reads_per_chunk}{Reads processed per streamed chunk (default: 1e5).}
+\item{n_reads_per_chunk}{Integer. Reads per streaming chunk (default: 1e5).}
+
+\item{enriched}{Logical. If TRUE, output includes additional columns for
+publication analyses: read_length, read1_pos, read1_match_width,
+read1_n_substitutions, read1_n_deletions, read1_n_insertions,
+read1_qscore, mean_qscore, major/minor_roi_method,
+major/minor_roi_matched_seq, major/minor_roi_n_substitutions,
+major/minor_roi_n_deletions, major/minor_roi_n_insertions,
+major/minor_roi_qscore, major/minor_base_qscore (default: FALSE).}
 }
 \value{
-Invisibly, nothing useful is returned; the SNV table is written to
-\code{<session_name>_snv_table.csv} in \code{path_output_folder}.
+Invisibly returns NULL. Writes a CSV file
+\code{{session_name}_snv_table.csv}. Core columns: read_id, CBC, UMI,
+strand, major_base, major_status, minor_base, minor_status. When
+\code{enriched = TRUE}, appends 22 additional columns with detection
+metadata, quality scores, per-error-type counts, and per-region/base
+Q-scores.
 }
 \description{
-Streams a FASTQ file in chunks and, for every read, detects the Read 1
-adapter, extracts the cell barcode and UMI, requires a poly(T) tail, and calls
-the base at a major region of interest (the mutation) and an optional minor
-region of interest (a SNP used later for phasing). Results are written to a
-CSV that feeds \code{\link{summarize_snv}}.
+Streams through a FASTQ file, detects adapter sequences, extracts cell
+barcodes and UMIs, and identifies SNVs at user-defined regions of interest
+using a two-pass strategy (exact match + pairwise alignment).
 }
-\seealso{
-\code{\link{summarize_snv}}, \code{\link{flag_snv}}
+\examples{
+\dontrun{
+detect_snv(
+    session_name       = "EXP28_iPSC",
+    path_input_file    = "experiment.fastq.gz",
+    path_output_folder = "output/",
+    read1_seq          = "CTACACGACGCTCTTCCGATCT",
+    read1_mismatch     = 4L,
+    major_roi_seq      = "GAGATTTCNCTGTAGCT",
+    major_roi_mismatch = 3L,
+    major_roi_mut      = "T",
+    major_roi_wt       = "A",
+    n_cores            = 4L
+)
+}
+
 }

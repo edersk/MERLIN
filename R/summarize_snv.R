@@ -1,40 +1,52 @@
 # =============================================================================
-# summarize_snv.R - Summarize SNV detection results (MERLIN)
+# summarize_snv.R - SNV Detection Results Summarization
 # =============================================================================
 #
-# Takes the per-read table written by detect_snv(), corrects UMIs within each
-# cell barcode using Levenshtein (edit) distance, and aggregates reads into a
-# per-cell summary. It also detects knee/inflection thresholds on the reads-per-
-# UMI distribution and reports SNP allele frequencies so the user can judge
-# whether phasing is feasible. Mutation calling itself is left to flag_snv().
+# Description:
+#   Processes output from detect_snv(), performs UMI error correction,
+#   and creates per-cell barcode summaries. Does NOT perform mutation calling.
+#   Use flag_snv() for mutation calling with thresholds.
+#
+# Author: Sebastian Eder <sebastian.eder@example.com>
+# Created: 2025-12-18
+# Version: 2.1.0
+#
+# Pipeline:
+#   detect_snv() -> summarize_snv() -> flag_snv()
+#
+# Features:
+#   - UMI correction for insertions, deletions, and substitutions
+#   - Per-CBC UMI summary with read counts
+#   - Knee/elbow/inflection point detection and diagnostic plots
+#   - Output compatible with flag_snv() for mutation calling
+#
+# License: MIT License
+#   Copyright (c) 2025 Sebastian Eder
+#
+# Dependencies:
+#   - Biostrings (>= 2.60.0)
+#   - data.table (>= 1.14.0)
+#   - parallel (>= 4.0.0)
+#   - inflection (>= 1.3.5)
+#
 # =============================================================================
 
 
-# --- Internal helpers --------------------------------------------------------
+# =============================================================================
+# HELPER FUNCTIONS
+# =============================================================================
 
-#' Format a count as "n (pct%)" for logging
-#' @noRd
+# Formats percentage for logging
 .fmt_pct <- function(n, total, digits = 1) {
     paste0(n, " (", round(100 * n / total, digits), "%)")
 }
 
 
-#' Collapse near-identical UMIs within one cell barcode
-#'
-#' Builds a pairwise Levenshtein distance matrix over the unique UMIs of a cell
-#' and greedily lets the most frequent UMI absorb any less-frequent UMI within
-#' the edit-distance threshold. Levenshtein distance covers substitutions,
-#' insertions and deletions, so it corrects both sequencing errors and indels.
-#'
-#' @param dt_cbc data.table for a single cell barcode with an \code{initial_UMI}
-#'   column.
-#' @param umi_mismatch Maximum edit distance for two UMIs to be merged.
-#' @param n_cores Unused here; kept for signature compatibility.
-#' @return A copy of \code{dt_cbc} with \code{corrected_UMI} and \code{corrected}
-#'   columns added.
-#' @noRd
+# Corrects UMI sequences within each CBC using pairwise distance matrix
+# Uses Levenshtein distance (edit distance) including insertions, deletions, substitutions
+# Algorithm: Most frequent UMI "absorbs" less frequent UMIs within distance threshold
 .correct_umis_optimized <- function(dt_cbc, umi_mismatch, n_cores) {
-    # .SD is locked, so operate on a copy before adding columns by reference.
+    # Make a copy - .SD is locked and cannot be modified with :=
     dt_cbc <- copy(dt_cbc)
 
     if (nrow(dt_cbc) <= 1L) {
@@ -42,7 +54,7 @@
         return(dt_cbc)
     }
 
-    # Count and sort UMIs by abundance so the most frequent is processed first.
+    # Count UMI frequencies and sort by abundance (most frequent first)
     umi_counts <- dt_cbc[, .N, by = initial_UMI]
     setorder(umi_counts, -N)
 
@@ -50,62 +62,87 @@
     umi_freq <- umi_counts$N
     n_unique <- length(unique_umis)
 
-    # A single unique UMI needs no correction.
+    # If only 1 unique UMI, nothing to correct
     if (n_unique <= 1L) {
         dt_cbc[, `:=`(corrected_UMI = initial_UMI, corrected = FALSE)]
         return(dt_cbc)
     }
 
-    # Each UMI initially maps to itself.
+    # Initialize mapping: each UMI maps to itself initially
     umi_to_corrected <- setNames(unique_umis, unique_umis)
 
-    # --- Pairwise Levenshtein distance matrix (with indels) ---
-    if (requireNamespace("stringdist", quietly = TRUE)) {
-        # method = "lv" is Levenshtein: substitutions + insertions + deletions.
-        dist_matrix <- stringdist::stringdistmatrix(unique_umis, unique_umis, method = "lv")
-    } else {
-        # Fallback edit distance via global alignment if stringdist is missing.
-        dist_matrix <- matrix(0L, nrow = n_unique, ncol = n_unique)
+    # =========================================================================
+    # GREEDY UMI CORRECTION (memory-efficient for large CBCs)
+    # =========================================================================
+    # For small CBCs (< 5000 unique UMIs): full pairwise distance matrix
+    # For large CBCs: compare each low-freq UMI against high-freq ones only
 
-        for (i in 1:(n_unique - 1)) {
-            for (j in (i + 1):n_unique) {
-                aln <- pwalign::pairwiseAlignment(
-                    unique_umis[i], unique_umis[j],
-                    type = "global",
-                    substitutionMatrix = nucleotideSubstitutionMatrix(match = 0, mismatch = 1),
-                    gapOpening = 0, gapExtension = 1
-                )
-                dist <- -pwalign::score(aln) # negative score = edit distance
-                dist_matrix[i, j] <- dist
-                dist_matrix[j, i] <- dist
+    absorbed <- rep(FALSE, n_unique)
+    max_matrix_size <- 5000L  # threshold for switching to row-wise computation
+
+    if (n_unique <= max_matrix_size) {
+        # Full distance matrix approach (fast for small CBCs)
+        if (requireNamespace("stringdist", quietly = TRUE)) {
+            dist_matrix <- stringdist::stringdistmatrix(unique_umis, unique_umis, method = "lv")
+        } else {
+            dist_matrix <- matrix(0L, nrow = n_unique, ncol = n_unique)
+            for (i in 1:(n_unique - 1)) {
+                for (j in (i + 1):n_unique) {
+                    aln <- pwalign::pairwiseAlignment(
+                        unique_umis[i], unique_umis[j], type = "global",
+                        substitutionMatrix = Biostrings::nucleotideSubstitutionMatrix(match = 0, mismatch = 1),
+                        gapOpening = 0, gapExtension = 1)
+                    dist <- -pwalign::score(aln)
+                    dist_matrix[i, j] <- dist
+                    dist_matrix[j, i] <- dist
+                }
+            }
+        }
+
+        for (i in seq_len(n_unique)) {
+            if (absorbed[i]) next
+            distances_to_i <- dist_matrix[i, ]
+            candidates <- which(
+                distances_to_i <= umi_mismatch & distances_to_i > 0 &
+                !absorbed & seq_len(n_unique) > i)
+            if (length(candidates) > 0) {
+                umi_to_corrected[unique_umis[candidates]] <- unique_umis[i]
+                absorbed[candidates] <- TRUE
+            }
+        }
+        rm(dist_matrix)
+    } else {
+        # Row-wise approach for large CBCs: compute distances one row at a time
+        # Process most frequent first; only compare against not-yet-absorbed UMIs
+        has_stringdist <- requireNamespace("stringdist", quietly = TRUE)
+
+        for (i in seq_len(n_unique)) {
+            if (absorbed[i]) next
+
+            # Only compare against less-frequent, non-absorbed UMIs
+            remaining <- which(!absorbed & seq_len(n_unique) > i)
+            if (length(remaining) == 0L) next
+
+            if (has_stringdist) {
+                dists <- stringdist::stringdist(unique_umis[i], unique_umis[remaining], method = "lv")
+            } else {
+                dists <- vapply(unique_umis[remaining], function(u) {
+                    aln <- pwalign::pairwiseAlignment(unique_umis[i], u, type = "global",
+                        substitutionMatrix = Biostrings::nucleotideSubstitutionMatrix(match = 0, mismatch = 1),
+                        gapOpening = 0, gapExtension = 1)
+                    -pwalign::score(aln)
+                }, numeric(1))
+            }
+
+            close_idx <- remaining[dists <= umi_mismatch & dists > 0]
+            if (length(close_idx) > 0) {
+                umi_to_corrected[unique_umis[close_idx]] <- unique_umis[i]
+                absorbed[close_idx] <- TRUE
             }
         }
     }
 
-    # --- Greedy absorption: frequent UMI swallows nearby rarer UMIs ---
-    absorbed <- rep(FALSE, n_unique)
-
-    # Because UMIs are sorted by descending frequency, a lower index means a more
-    # frequent UMI; each one absorbs the less-frequent, unabsorbed UMIs near it.
-    for (i in seq_len(n_unique)) {
-        if (absorbed[i]) next # already merged into a more frequent UMI
-
-        distances_to_i <- dist_matrix[i, ]
-
-        candidates <- which(
-            distances_to_i <= umi_mismatch &
-                distances_to_i > 0 & # exclude self
-                !absorbed &
-                seq_len(n_unique) > i # only less-frequent UMIs
-        )
-
-        if (length(candidates) > 0) {
-            umi_to_corrected[unique_umis[candidates]] <- unique_umis[i]
-            absorbed[candidates] <- TRUE
-        }
-    }
-
-    # Apply the mapping and flag which reads had their UMI changed.
+    # Apply corrections
     dt_cbc[, corrected_UMI := umi_to_corrected[initial_UMI]]
     dt_cbc[, corrected := initial_UMI != corrected_UMI]
 
@@ -113,74 +150,72 @@
 }
 
 
-#' Detect knee / inflection thresholds on a rank-abundance curve
-#'
-#' Estimates candidate reads-per-UMI cutoffs using several complementary methods
-#' (geometric knee, spline-derivative inflection, lower knee, the \code{uik}
-#' method, and a CellRanger-style order-of-magnitude rule), all computed in
-#' log-log space. Returns each estimate plus the min/max of the finite ones as a
-#' suggested threshold range.
-#'
-#' @param x Ranks (x-axis of the rank-abundance curve).
-#' @param y Reads per UMI (y-axis), aligned to \code{x}.
-#' @return Named list of rounded threshold estimates.
-#' @noRd
+# All-NA knee point result (too few points to estimate anything).
+# Must contain every key that .detect_knee_points() returns on success so
+# downstream is.finite() checks never see NULL.
+.empty_knee_points <- function() {
+    list(
+        upper_knee = NA_real_, inflection = NA_real_, lower_knee = NA_real_,
+        uik = NA_real_, cellranger = NA_real_, otsu = NA_real_, mixture = NA_real_,
+        lower = NA_real_, upper = NA_real_
+    )
+}
+
+
+# Detect knee/elbow points using multiple methods
+# Works in log-log space for rank-abundance distributions
 .detect_knee_points <- function(x, y) {
     if (length(x) < 10L) {
-        return(list(
-            upper_knee = NA_real_, inflection = NA_real_, lower_knee = NA_real_,
-            cellranger = NA_real_, uik = NA_real_,
-            lower = NA_real_, upper = NA_real_
-        ))
+        return(.empty_knee_points())
     }
 
-    # Keep only strictly positive, finite points (log space requires this).
+    # Remove invalid values
     valid <- is.finite(x) & is.finite(y) & y > 0 & x > 0
     x <- x[valid]
     y <- y[valid]
-    n <- length(x) # total points (used by the CellRanger rule)
+    n <- length(x) # Total number of points (for CellRanger calculation)
 
     if (n < 10L) {
-        return(list(
-            upper_knee = NA_real_, inflection = NA_real_, lower_knee = NA_real_,
-            cellranger = NA_real_, uik = NA_real_,
-            lower = NA_real_, upper = NA_real_
-        ))
+        return(.empty_knee_points())
     }
 
-    # Rank-abundance curves are analysed in log-log space.
+    # Work in log-log space (appropriate for rank-abundance curves)
     x_log <- log10(x)
     y_log <- log10(y)
 
-    # --- Method 1: geometric knee ---
-    # Point of maximum perpendicular distance from the line joining the two
-    # endpoints, i.e. where the curve bends most sharply.
+    # === Method 1: Geometric knee detection ===
+    # Find point of maximum perpendicular distance from line connecting endpoints
+    # This identifies where the curve bends most sharply
+
     .find_geometric_knee <- function(x_vals, y_vals) {
         n <- length(x_vals)
         if (n < 3) {
             return(NA_integer_)
         }
 
+        # Line from first to last point
         x1 <- x_vals[1]
         y1 <- y_vals[1]
         x2 <- x_vals[n]
         y2 <- y_vals[n]
 
-        # Perpendicular distance of each point to the endpoint-to-endpoint line.
+        # Calculate perpendicular distance for each point
+        # Distance = |ax + by + c| / sqrt(a^2 + b^2)
+        # where line is: (y2-y1)x - (x2-x1)y + (x2-x1)y1 - (y2-y1)x1 = 0
         a <- y2 - y1
         b <- -(x2 - x1)
         c <- (x2 - x1) * y1 - (y2 - y1) * x1
 
         distances <- abs(a * x_vals + b * y_vals + c) / sqrt(a^2 + b^2)
 
-        # Ignore the endpoints themselves.
+        # Find point with maximum distance (excluding endpoints)
         distances[1] <- 0
         distances[n] <- 0
 
         which.max(distances)
     }
 
-    # Only strip obvious noise (UMIs seen 1-2 times); keep enough points to fit.
+    # Only exclude obvious noise (y <= 2)
     meaningful_idx <- which(y > 2)
     n_meaningful <- length(meaningful_idx)
 
@@ -193,7 +228,8 @@
     y_meaningful_raw <- y_log[meaningful_idx]
     y_orig_meaningful <- y[meaningful_idx]
 
-    # --- Smooth the curve (DropletUtils-style) for stable derivatives ---
+    # === Apply smooth.spline for curve fitting (DropletUtils approach) ===
+    # Use smooth.spline with controlled degrees of freedom for stable derivatives
     spline_fit <- tryCatch(
         {
             smooth.spline(x_meaningful, y_meaningful_raw, df = min(20, n_meaningful / 3))
@@ -204,11 +240,14 @@
     if (!is.null(spline_fit)) {
         y_fitted <- predict(spline_fit, x_meaningful)$y
 
-        # First derivative (slope) and second derivative (curvature).
+        # Calculate derivatives from spline
+        # First derivative (slope)
         d1 <- predict(spline_fit, x_meaningful, deriv = 1)$y
+
+        # Second derivative (curvature)
         d2 <- predict(spline_fit, x_meaningful, deriv = 2)$y
     } else {
-        # If the spline fails, fall back to a loess fit and finite differences.
+        # Fallback: use loess if spline fails
         y_fitted <- tryCatch(
             {
                 lo <- loess(y_meaningful_raw ~ x_meaningful, span = 0.1)
@@ -217,14 +256,17 @@
             error = function(e) y_meaningful_raw
         )
 
+        # Approximate derivatives from smoothed data
         d1 <- c(0, diff(y_fitted) / diff(x_meaningful))
         d2 <- c(0, diff(d1))
     }
 
-    # --- Knee point (max negative signed curvature) ---
+    # === KNEE POINT (DropletUtils method) ===
+    # Knee = point where signed curvature is minimized (maximum negative curvature)
+    # Curvature = d2y / (1 + d1y^2)^(3/2)
     curvature <- d2 / (1 + d1^2)^1.5
 
-    # Search only the upper half of the curve to avoid the noisy tail.
+    # Find knee: minimum curvature in the upper portion of curve (exclude noisy tail)
     upper_portion <- 1:min(floor(n_meaningful * 0.5), n_meaningful)
     knee_idx <- upper_portion[which.min(curvature[upper_portion])]
     upper_knee <- if (length(knee_idx) > 0 && knee_idx >= 1 && knee_idx <= length(y_orig_meaningful)) {
@@ -233,7 +275,9 @@
         NA_real_
     }
 
-    # --- Inflection point (steepest descent = minimum first derivative) ---
+    # === INFLECTION POINT (DropletUtils method) ===
+    # Inflection = point where first derivative is minimized (steepest descent)
+    # Look across the full meaningful range
     inflection_idx <- which.min(d1)
     inflection_knee <- if (length(inflection_idx) > 0 && inflection_idx >= 1 && inflection_idx <= length(y_orig_meaningful)) {
         y_orig_meaningful[inflection_idx]
@@ -241,7 +285,8 @@
         NA_real_
     }
 
-    # --- Lower knee (where the curve flattens: max positive curvature) ---
+    # === LOWER KNEE (transition to flat) ===
+    # Find where curvature becomes most positive (curve flattening) in lower portion
     lower_portion <- floor(n_meaningful * 0.5):n_meaningful
     lower_knee_local <- lower_portion[which.max(curvature[lower_portion])]
     lower_knee <- if (length(lower_knee_local) > 0 && lower_knee_local >= 1 && lower_knee_local <= length(y_orig_meaningful)) {
@@ -250,7 +295,7 @@
         NA_real_
     }
 
-    # --- UIK (unit-invariant knee) from the inflection package, as a backup ---
+    # === UIK from inflection package (backup method) ===
     uik_knee <- tryCatch(
         {
             knee_x <- inflection::uik(x_meaningful, y_meaningful_raw)
@@ -264,8 +309,8 @@
         error = function(e) NA_real_
     )
 
-    # --- CellRanger-style order-of-magnitude rule ---
-    # 10x uses m = 99th percentile of the top-N barcodes, threshold = m / 10.
+    # === CellRanger-style OrdMag ===
+    # 10x Genomics uses: m = 99th percentile of top N barcodes, threshold = m/10
     cellranger_knee <- tryCatch(
         {
             n_expected <- max(100, floor(n * 0.01))
@@ -276,8 +321,128 @@
         error = function(e) NA_real_
     )
 
-    # Combine all finite estimates into a suggested threshold range.
-    all_knees <- c(upper_knee, inflection_knee, lower_knee, uik_knee, cellranger_knee)
+    # === Otsu's method ===
+    # Maximize inter-class variance on log10(reads per UMI) histogram
+    # Borrowed from image thresholding — finds the cut that best separates
+    # two populations (signal vs noise) in the intensity histogram
+    otsu_knee <- tryCatch(
+        {
+            log_y <- log10(y[y > 0])
+            n_bins <- min(256L, length(unique(log_y)))
+            h <- hist(log_y, breaks = n_bins, plot = FALSE)
+            counts <- h$counts
+            mids <- h$mids
+            total <- sum(counts)
+
+            best_variance <- -Inf
+            best_threshold <- NA_real_
+
+            cum_sum_w <- 0
+            cum_sum_wm <- 0
+            global_mean <- sum(counts * mids) / total
+
+            for (t in seq_len(length(counts) - 1L)) {
+                cum_sum_w <- cum_sum_w + counts[t]
+                cum_sum_wm <- cum_sum_wm + counts[t] * mids[t]
+
+                w0 <- cum_sum_w / total
+                w1 <- 1 - w0
+                if (w0 == 0 || w1 == 0) next
+
+                mu0 <- cum_sum_wm / cum_sum_w
+                mu1 <- (global_mean * total - cum_sum_wm) / (total - cum_sum_w)
+
+                between_var <- w0 * w1 * (mu0 - mu1)^2
+
+                if (between_var > best_variance) {
+                    best_variance <- between_var
+                    best_threshold <- mids[t]
+                }
+            }
+
+            if (!is.na(best_threshold)) round(10^best_threshold) else NA_real_
+        },
+        error = function(e) NA_real_
+    )
+
+    # === Mixture model (2-component Gaussian in log-space) ===
+    # Fits two normal distributions to log10(reads per UMI) using EM algorithm
+    # The intersection of the two components defines the threshold
+    mixture_knee <- tryCatch(
+        {
+            log_y <- log10(y[y > 0])
+            n_obs <- length(log_y)
+            if (n_obs < 50L) stop("too few observations")
+
+            # Initialize: split at median
+            med <- median(log_y)
+            mu1 <- mean(log_y[log_y <= med])
+            mu2 <- mean(log_y[log_y > med])
+            sd1 <- sd(log_y[log_y <= med])
+            sd2 <- sd(log_y[log_y > med])
+            pi1 <- 0.5
+
+            if (is.na(sd1) || sd1 == 0) sd1 <- sd(log_y) / 2
+            if (is.na(sd2) || sd2 == 0) sd2 <- sd(log_y) / 2
+
+            # EM iterations
+            for (iter in seq_len(100L)) {
+                # E-step: posterior probability of component 1
+                d1 <- pi1 * dnorm(log_y, mu1, sd1)
+                d2 <- (1 - pi1) * dnorm(log_y, mu2, sd2)
+                total_d <- d1 + d2
+                total_d[total_d == 0] <- .Machine$double.xmin
+                gamma <- d1 / total_d
+
+                # M-step
+                n1 <- sum(gamma)
+                n2 <- n_obs - n1
+                if (n1 < 2 || n2 < 2) break
+
+                pi1_new <- n1 / n_obs
+                mu1_new <- sum(gamma * log_y) / n1
+                mu2_new <- sum((1 - gamma) * log_y) / n2
+                sd1_new <- sqrt(sum(gamma * (log_y - mu1_new)^2) / n1)
+                sd2_new <- sqrt(sum((1 - gamma) * (log_y - mu2_new)^2) / n2)
+
+                if (sd1_new < 1e-6) sd1_new <- 1e-6
+                if (sd2_new < 1e-6) sd2_new <- 1e-6
+
+                # Check convergence
+                if (abs(mu1_new - mu1) + abs(mu2_new - mu2) < 1e-6) break
+
+                mu1 <- mu1_new; mu2 <- mu2_new
+                sd1 <- sd1_new; sd2 <- sd2_new
+                pi1 <- pi1_new
+            }
+
+            # Ensure mu1 < mu2 (component 1 = noise, component 2 = signal)
+            if (mu1 > mu2) {
+                tmp <- mu1; mu1 <- mu2; mu2 <- tmp
+                tmp <- sd1; sd1 <- sd2; sd2 <- tmp
+                pi1 <- 1 - pi1
+            }
+
+            # Find intersection between mu1 and mu2
+            search_grid <- seq(mu1, mu2, length.out = 1000L)
+            f1 <- pi1 * dnorm(search_grid, mu1, sd1)
+            f2 <- (1 - pi1) * dnorm(search_grid, mu2, sd2)
+            cross_idx <- which(diff(sign(f2 - f1)) != 0)
+
+            if (length(cross_idx) > 0) {
+                threshold_log <- search_grid[cross_idx[1]]
+                round(10^threshold_log)
+            } else {
+                # Fallback: midpoint between means
+                round(10^((mu1 + mu2) / 2))
+            }
+        },
+        error = function(e) NA_real_
+    )
+
+    # Compile results
+    all_knees <- c(upper_knee, inflection_knee, lower_knee, uik_knee,
+                   cellranger_knee, otsu_knee, mixture_knee)
     all_knees <- all_knees[is.finite(all_knees) & all_knees > 1]
 
     if (length(all_knees) > 0L) {
@@ -293,25 +458,15 @@
         lower_knee = round(lower_knee),
         uik = round(uik_knee),
         cellranger = round(cellranger_knee),
+        otsu = round(otsu_knee),
+        mixture = round(mixture_knee),
         lower = round(lower),
         upper = round(upper)
     ))
 }
 
 
-#' Write a 2x2 diagnostic PDF for the reads-per-UMI distribution
-#'
-#' Panels: (1) smoothed rank-abundance curve with threshold lines, (2) histogram
-#' of reads per UMI, (3) cumulative read distribution, and (4) violin plots of
-#' major reads split by minor-ROI classification. Wrapped in tryCatch so a
-#' plotting failure never aborts the summarisation.
-#'
-#' @param umi_freq data.table with \code{rank} and \code{n_reads}.
-#' @param knee_points Output of \code{.detect_knee_points}.
-#' @param output_folder,session_name Where and how to name the PDF.
-#' @param dt_umi_counts Optional per-UMI counts used for the 4th panel.
-#' @return Invisibly \code{NULL}; called for the side effect of writing a PDF.
-#' @noRd
+# Generate comprehensive diagnostic plots for reads per UMI
 .plot_umi_distribution <- function(umi_freq, knee_points, output_folder, session_name,
                                    dt_umi_counts = NULL) {
     tryCatch(
@@ -320,13 +475,14 @@
 
             pdf(plot_file, width = 14, height = 10)
 
-            # 2x2 panel layout.
+            # Layout: 2x2 grid
             par(mfrow = c(2, 2), mar = c(4.5, 4.5, 3, 1))
 
-            # Smooth the rank-abundance data in log-log space for panel 1.
+            # Prepare smoothed data for plotting (in log-log space)
             x_log <- log10(umi_freq$rank)
             y_log <- log10(umi_freq$n_reads)
 
+            # Use loess smoothing
             smooth_span <- min(0.1, 100 / nrow(umi_freq))
             lo <- tryCatch(
                 {
@@ -338,21 +494,22 @@
             if (!is.null(lo)) {
                 y_smooth <- predict(lo)
             } else {
-                y_smooth <- y_log # fall back to the raw curve
+                y_smooth <- y_log # Fall back to raw data
             }
 
-            # === Panel 1: smoothed reads-per-UMI rank-abundance curve ===
+            # === Plot 1: Ranked reads per UMI distribution (log-log scale) - SMOOTHED ===
             plot(umi_freq$rank, umi_freq$n_reads,
-                type = "n", # empty: draw axes only, then add the smoothed line
+                type = "n", # Empty plot for axes
                 log = "xy",
                 xlab = "UMI Rank (log scale)",
                 ylab = "Reads per UMI (log scale)",
                 main = "Reads per UMI Distribution - Smoothed"
             )
 
+            # Add smoothed line
             lines(10^x_log, 10^y_smooth, col = "steelblue", lwd = 2)
 
-            # Overlay each detected threshold as a labelled horizontal line.
+            # Add knee point lines with labels
             if (is.finite(knee_points$upper_knee)) {
                 abline(h = knee_points$upper_knee, col = "red", lwd = 2, lty = 1)
                 text(par("usr")[1] + 0.02 * diff(par("usr")[1:2]), knee_points$upper_knee,
@@ -381,28 +538,46 @@
                     pos = 3, col = "darkgreen", cex = 0.8
                 )
             }
+            if (is.finite(knee_points$otsu)) {
+                abline(h = knee_points$otsu, col = "brown", lwd = 2, lty = 5)
+                text(par("usr")[1] + 0.02 * diff(par("usr")[1:2]), knee_points$otsu,
+                    sprintf("Otsu: %d", knee_points$otsu),
+                    pos = 3, col = "brown", cex = 0.8
+                )
+            }
+            if (is.finite(knee_points$mixture)) {
+                abline(h = knee_points$mixture, col = "deeppink", lwd = 2, lty = 6)
+                text(par("usr")[1] + 0.02 * diff(par("usr")[1:2]), knee_points$mixture,
+                    sprintf("Mixture: %d", knee_points$mixture),
+                    pos = 3, col = "deeppink", cex = 0.8
+                )
+            }
 
+            # Build legend dynamically
+            leg_labels <- "Reads per UMI (smoothed)"
+            leg_cols <- "steelblue"
+            leg_ltys <- 1L
+            kp_entries <- list(
+                list(knee_points$upper_knee, "Upper Knee", "red", 1L),
+                list(knee_points$inflection, "Inflection", "orange", 2L),
+                list(knee_points$lower_knee, "Lower Knee", "purple", 3L),
+                list(knee_points$cellranger, "CellRanger", "darkgreen", 4L),
+                list(knee_points$otsu, "Otsu", "brown", 5L),
+                list(knee_points$mixture, "Mixture", "deeppink", 6L)
+            )
+            for (kp in kp_entries) {
+                if (is.finite(kp[[1]])) {
+                    leg_labels <- c(leg_labels, sprintf("%s: %d", kp[[2]], kp[[1]]))
+                    leg_cols <- c(leg_cols, kp[[3]])
+                    leg_ltys <- c(leg_ltys, kp[[4]])
+                }
+            }
             legend("topright",
-                legend = c(
-                    "Reads per UMI (smoothed)",
-                    if (is.finite(knee_points$upper_knee)) sprintf("Upper Knee: %d", knee_points$upper_knee) else NULL,
-                    if (is.finite(knee_points$inflection)) sprintf("Inflection: %d", knee_points$inflection) else NULL,
-                    if (is.finite(knee_points$lower_knee)) sprintf("Lower Knee: %d", knee_points$lower_knee) else NULL,
-                    if (is.finite(knee_points$cellranger)) sprintf("CellRanger: %d", knee_points$cellranger) else NULL
-                ),
-                col = c(
-                    "steelblue",
-                    if (is.finite(knee_points$upper_knee)) "red" else NULL,
-                    if (is.finite(knee_points$inflection)) "orange" else NULL,
-                    if (is.finite(knee_points$lower_knee)) "purple" else NULL,
-                    if (is.finite(knee_points$cellranger)) "darkgreen" else NULL
-                ),
-                lwd = 2,
-                lty = c(1, 1, 2, 3, 4)[1:(1 + sum(is.finite(c(knee_points$upper_knee, knee_points$inflection, knee_points$lower_knee, knee_points$cellranger))))],
+                legend = leg_labels, col = leg_cols, lwd = 2, lty = leg_ltys,
                 cex = 0.6, bg = "white"
             )
 
-            # === Panel 2: histogram of reads per UMI (log x) ===
+            # === Plot 2: Histogram of reads per UMI (log x-axis) ===
             hist(log10(umi_freq$n_reads + 1),
                 breaks = 50,
                 col = "lightblue", border = "white",
@@ -411,6 +586,7 @@
                 main = "Distribution of Reads per UMI"
             )
 
+            # Add knee lines
             if (is.finite(knee_points$upper_knee)) {
                 abline(v = log10(knee_points$upper_knee), col = "red", lwd = 2)
             }
@@ -420,8 +596,14 @@
             if (is.finite(knee_points$cellranger)) {
                 abline(v = log10(knee_points$cellranger), col = "darkgreen", lwd = 2, lty = 4)
             }
+            if (is.finite(knee_points$otsu)) {
+                abline(v = log10(knee_points$otsu), col = "brown", lwd = 2, lty = 5)
+            }
+            if (is.finite(knee_points$mixture)) {
+                abline(v = log10(knee_points$mixture), col = "deeppink", lwd = 2, lty = 6)
+            }
 
-            # === Panel 3: cumulative read distribution ===
+            # === Plot 3: Cumulative distribution (log x-axis) ===
             cumulative <- cumsum(umi_freq$n_reads) / sum(umi_freq$n_reads)
             plot(umi_freq$rank, cumulative,
                 type = "l", lwd = 2, col = "darkgreen",
@@ -431,7 +613,7 @@
                 main = "Cumulative Read Distribution"
             )
 
-            # Mark where each threshold falls on the cumulative curve.
+            # Mark knee points on cumulative
             if (is.finite(knee_points$upper_knee)) {
                 upper_rank <- which.min(abs(umi_freq$n_reads - knee_points$upper_knee))
                 abline(v = upper_rank, col = "red", lwd = 2)
@@ -445,23 +627,33 @@
                 cr_rank <- which.min(abs(umi_freq$n_reads - knee_points$cellranger))
                 abline(v = cr_rank, col = "darkgreen", lwd = 2, lty = 4)
             }
+            if (is.finite(knee_points$otsu)) {
+                otsu_rank <- which.min(abs(umi_freq$n_reads - knee_points$otsu))
+                abline(v = otsu_rank, col = "brown", lwd = 2, lty = 5)
+            }
+            if (is.finite(knee_points$mixture)) {
+                mix_rank <- which.min(abs(umi_freq$n_reads - knee_points$mixture))
+                abline(v = mix_rank, col = "deeppink", lwd = 2, lty = 6)
+            }
 
             grid(col = "gray90")
 
-            # === Panel 4: major reads split by minor-ROI classification ===
+            # === Plot 4: Violin plots of major reads by minor ROI classification ===
             if (!is.null(dt_umi_counts) && nrow(dt_umi_counts) > 0) {
-                # Keep only UMIs with a reasonable amount of major-ROI support.
+                # Filter: only UMIs with major overall count >= 4
                 dt_plot <- copy(dt_umi_counts)
                 dt_plot[, n_major := n_mut + n_wt]
                 dt_plot[, n_minor := n_minor_mut + n_minor_wt]
                 dt_plot <- dt_plot[n_major >= 4]
 
                 if (nrow(dt_plot) > 0) {
-                    # Major class: whichever allele dominates the UMI.
+                    # Classify major status: MUT if n_mut > n_wt, else WT
                     dt_plot[, major_class := ifelse(n_mut > n_wt, "Major MUT", "Major WT")]
 
-                    # Minor class relative to an 80%-of-major support threshold:
-                    # "minor NA" if there is too little minor signal to trust.
+                    # Classify minor status based on 80% threshold of major count
+                    # minor NA: no minor counts OR minor < 80% of major
+                    # minor MUT: minor_mut >= 80% of major
+                    # minor WT: minor_wt >= 80% of major
                     dt_plot[, minor_threshold := n_major * 0.8]
                     dt_plot[, minor_class := ifelse(
                         n_minor == 0 | n_minor < minor_threshold,
@@ -471,10 +663,10 @@
                         )
                     )]
 
-                    # y = log10 of the dominant major count.
+                    # Y values: log10 of major reads (use dominant count)
                     dt_plot[, y_val := log10(pmax(n_mut, n_wt))]
 
-                    # Group = minor class over major class, in a fixed panel order.
+                    # Create factor for grouping - ordered by minor status first
                     dt_plot[, group := paste(minor_class, major_class, sep = "\n")]
                     dt_plot[, group := factor(group, levels = c(
                         "minor NA\nMajor MUT", "minor NA\nMajor WT",
@@ -482,7 +674,7 @@
                         "minor WT\nMajor MUT", "minor WT\nMajor WT"
                     ))]
 
-                    # Consistent fill colours: MUT red-ish, WT blue-ish.
+                    # Colors for groups - consistent colors for Major MUT vs WT
                     group_colors <- c(
                         "minor NA\nMajor MUT" = "firebrick",
                         "minor NA\nMajor WT" = "steelblue",
@@ -492,16 +684,23 @@
                         "minor WT\nMajor WT" = "steelblue"
                     )
 
+                    # Prepare data for violin plots — keep ALL defined groups
+                    all_group_levels <- levels(dt_plot$group)
                     group_list <- split(dt_plot$y_val, dt_plot$group)
+                    # Ensure all levels exist (empty ones get length-0 vectors)
+                    for (gl in all_group_levels) {
+                        if (is.null(group_list[[gl]])) group_list[[gl]] <- numeric(0)
+                    }
+                    group_list <- group_list[all_group_levels]
 
-                    # Drop empty groups but preserve the factor ordering.
-                    group_list <- group_list[sapply(group_list, length) > 0]
+                    # Check there is any data at all
+                    has_any_data <- any(sapply(group_list, length) > 0)
 
-                    if (length(group_list) > 0) {
-                        # Lay out violins with a visual gap between minor groups.
+                    if (has_any_data) {
                         n_groups <- length(group_list)
                         group_names <- names(group_list)
 
+                        # Calculate x positions with gaps between minor groups
                         x_positions <- numeric(n_groups)
                         gap <- 0.5
                         pos <- 1
@@ -516,9 +715,11 @@
                             pos <- pos + 1
                         }
 
-                        y_range <- range(unlist(group_list), na.rm = TRUE)
-                        y_range <- c(y_range[1] - 0.1 * diff(y_range), y_range[2] + 0.25 * diff(y_range))
+                        non_empty_vals <- unlist(group_list[sapply(group_list, length) > 0])
+                        y_range <- range(non_empty_vals, na.rm = TRUE)
+                        y_range <- c(y_range[1] - 0.15 * diff(y_range), y_range[2] + 0.25 * diff(y_range))
 
+                        # Set up empty plot
                         plot(NULL,
                             xlim = c(0.5, max(x_positions) + 0.5), ylim = y_range,
                             xlab = "", ylab = "log10(Major Reads)",
@@ -526,10 +727,11 @@
                             xaxt = "n"
                         )
 
-                        # Dashed separators between minor groups.
+                        # Add group separators
                         unique_minors <- unique(sub("\n.*", "", group_names))
                         if (length(unique_minors) > 1) {
                             for (i in 2:length(unique_minors)) {
+                                # Find where the gap is
                                 idx <- which(sub("\n.*", "", group_names) == unique_minors[i])[1]
                                 if (!is.na(idx) && idx > 1) {
                                     sep_x <- (x_positions[idx - 1] + x_positions[idx]) / 2
@@ -538,15 +740,16 @@
                             }
                         }
 
-                        # Simplified per-violin labels (just MUT / WT).
+                        # Add x-axis labels (simplified: just MUT/WT)
                         simple_labels <- sub(".*\nMajor ", "", group_names)
                         axis(1, at = x_positions, labels = simple_labels, las = 1, cex.axis = 0.8)
 
-                        # Minor-group headers centred over their violins.
+                        # Add minor group labels at top
                         for (minor_group in unique_minors) {
                             idx <- which(sub("\n.*", "", group_names) == minor_group)
                             if (length(idx) > 0) {
                                 mid_x <- mean(x_positions[idx])
+                                # Display minor group label
                                 label <- gsub("minor ", "", minor_group)
                                 text(mid_x, y_range[2] - 0.02 * diff(y_range),
                                     label,
@@ -555,15 +758,17 @@
                             }
                         }
 
-                        # Draw a density-based violin (or a bar for tiny groups).
+                        # Draw violin for each group
                         for (i in seq_along(group_list)) {
                             vals <- group_list[[i]]
                             x_pos <- x_positions[i]
                             if (length(vals) > 2) {
+                                # Compute density
                                 dens <- density(vals, bw = "SJ", n = 512)
-                                # Scale the density to a fixed half-width of 0.35.
+                                # Scale density to fit within 0.35 width
                                 dens_scaled <- dens$y / max(dens$y) * 0.35
 
+                                # Draw polygon (violin shape)
                                 polygon(
                                     x = c(x_pos - dens_scaled, rev(x_pos + dens_scaled)),
                                     y = c(dens$x, rev(dens$x)),
@@ -571,14 +776,14 @@
                                     border = "black", lwd = 0.5
                                 )
                             } else if (length(vals) > 0) {
-                                # Too few points for a density: draw a median tick.
+                                # For small n, just draw a horizontal line
                                 segments(x_pos - 0.2, median(vals), x_pos + 0.2, median(vals),
                                     col = group_colors[group_names[i]], lwd = 3
                                 )
                             }
                         }
 
-                        # Threshold lines (only meaningful at >= 4 major reads).
+                        # Add threshold lines with labels
                         if (is.finite(knee_points$upper_knee) && knee_points$upper_knee >= 4) {
                             thresh_y <- log10(knee_points$upper_knee)
                             abline(h = thresh_y, col = "red", lwd = 1.5, lty = 1)
@@ -603,15 +808,31 @@
                                 pos = 2, col = "darkgreen", cex = 0.6
                             )
                         }
+                        if (is.finite(knee_points$otsu) && knee_points$otsu >= 4) {
+                            thresh_y <- log10(knee_points$otsu)
+                            abline(h = thresh_y, col = "brown", lwd = 1.5, lty = 5)
+                            text(par("usr")[2], thresh_y,
+                                sprintf("Otsu: %d", knee_points$otsu),
+                                pos = 2, col = "brown", cex = 0.6
+                            )
+                        }
+                        if (is.finite(knee_points$mixture) && knee_points$mixture >= 4) {
+                            thresh_y <- log10(knee_points$mixture)
+                            abline(h = thresh_y, col = "deeppink", lwd = 1.5, lty = 6)
+                            text(par("usr")[2], thresh_y,
+                                sprintf("Mixture: %d", knee_points$mixture),
+                                pos = 2, col = "deeppink", cex = 0.6
+                            )
+                        }
 
-                        # Per-group sample size labels.
+                        # Add count labels at the bottom of each group
                         counts <- sapply(group_list, length)
-                        text(seq_along(group_list), par("usr")[4] - 0.1,
+                        text(x_positions, y_range[1] + 0.02 * diff(y_range),
                             paste0("n=", counts),
-                            cex = 0.6, pos = 1
+                            cex = 0.6, pos = 3
                         )
 
-                        # Threshold legend.
+                        # Add threshold legend
                         threshold_labels <- c()
                         threshold_colors <- c()
                         threshold_ltys <- c()
@@ -629,6 +850,16 @@
                             threshold_labels <- c(threshold_labels, sprintf("CellRanger: %d", knee_points$cellranger))
                             threshold_colors <- c(threshold_colors, "darkgreen")
                             threshold_ltys <- c(threshold_ltys, 4)
+                        }
+                        if (is.finite(knee_points$otsu)) {
+                            threshold_labels <- c(threshold_labels, sprintf("Otsu: %d", knee_points$otsu))
+                            threshold_colors <- c(threshold_colors, "brown")
+                            threshold_ltys <- c(threshold_ltys, 5)
+                        }
+                        if (is.finite(knee_points$mixture)) {
+                            threshold_labels <- c(threshold_labels, sprintf("Mixture: %d", knee_points$mixture))
+                            threshold_colors <- c(threshold_colors, "deeppink")
+                            threshold_ltys <- c(threshold_ltys, 6)
                         }
                         if (length(threshold_labels) > 0) {
                             legend("topright",
@@ -649,7 +880,7 @@
                     text(0.5, 0.5, "No UMIs with major count >= 2", cex = 1.2)
                 }
             } else {
-                # No per-UMI data supplied: leave a placeholder panel.
+                # Placeholder if no data
                 plot.new()
                 text(0.5, 0.5, "No UMI count data available", cex = 1.2)
             }
@@ -665,30 +896,22 @@
 }
 
 
-#' Build major- and minor-ROI SNP frequency tables and assess phasing
-#'
-#' Summarises reads/UMIs/cells per allele for the major ROI and, when present,
-#' the minor ROI, then decides whether phasing is viable (both minor alleles must
-#' be present at reasonable frequency).
-#'
-#' @param dt_corrected UMI-corrected read table.
-#' @param has_minor Whether usable minor-ROI data is present.
-#' @return List with \code{major_freq}, \code{minor_freq}, \code{combined},
-#'   \code{phasing_viable} and \code{phasing_message}.
-#' @noRd
+# Create SNP frequency tables for major and minor ROI
+# Helps user decide if phasing is possible (minor ROI needs both alleles)
 .create_snp_frequency_tables <- function(dt_corrected, has_minor) {
-    # --- Major ROI frequency table ---
-    # n_cells_with_status counts cells that have >= 1 UMI of that status, so a
-    # cell carrying both WT and MUT UMIs is counted under both.
+    # === Major ROI frequency table ===
+    # Note: n_cells_with_status counts cells having UMIs of that status
+    # A cell with both WT and MUT UMIs will appear in BOTH counts
     dt_major_freq <- dt_corrected[, .(
         n_reads = .N,
         n_umis = uniqueN(paste0(CBC, "_", corrected_UMI)),
         n_cells_with_status = uniqueN(CBC)
     ), by = major_status]
 
+    # Add percentages
     total_reads <- sum(dt_major_freq$n_reads)
     total_umis <- sum(dt_major_freq$n_umis)
-    total_cells <- uniqueN(dt_corrected$CBC) # actual unique cells
+    total_cells <- uniqueN(dt_corrected$CBC) # Actual unique cells
 
     dt_major_freq[, `:=`(
         pct_reads = round(100 * n_reads / total_reads, 2),
@@ -699,7 +922,7 @@
     setnames(dt_major_freq, "major_status", "status")
     dt_major_freq[, roi := "major"]
 
-    # --- Minor ROI frequency table (only if phasing data exists) ---
+    # === Minor ROI frequency table (if present) ===
     dt_minor_freq <- NULL
     phasing_viable <- FALSE
     phasing_message <- "No minor ROI data available"
@@ -714,6 +937,7 @@
                 n_cells_with_status = uniqueN(CBC)
             ), by = minor_status]
 
+            # Add percentages
             total_reads_minor <- sum(dt_minor_freq$n_reads)
             total_umis_minor <- sum(dt_minor_freq$n_umis)
 
@@ -726,7 +950,9 @@
             setnames(dt_minor_freq, "minor_status", "status")
             dt_minor_freq[, roi := "minor"]
 
-            # Phasing needs both minor alleles present at >= 10% of UMIs each.
+            # Assess phasing viability
+            # For phasing to work, we need both alleles (MUT and WT) present
+            # with reasonable frequency (e.g., each >10% of UMIs)
             has_mut <- "MUT" %in% dt_minor_freq$status
             has_wt <- "WT" %in% dt_minor_freq$status
 
@@ -752,7 +978,7 @@
         }
     }
 
-    # Stack major + minor for a single combined view.
+    # Combine tables for easier viewing
     if (!is.null(dt_minor_freq)) {
         dt_combined <- rbind(dt_major_freq, dt_minor_freq, fill = TRUE)
     } else {
@@ -769,43 +995,68 @@
 }
 
 
-# --- Main function -----------------------------------------------------------
+# =============================================================================
+# MAIN FUNCTION
+# =============================================================================
 
-#' Summarize SNV detection results (UMI correction, no calling)
+#' Summarize SNV Detection Results
 #'
-#' Processes the per-read table from \code{\link{detect_snv}}, corrects UMIs
-#' within each cell barcode using Levenshtein distance, and produces a per-cell
-#' summary of reads per corrected UMI. It also detects knee/inflection thresholds
-#' on the reads-per-UMI distribution and reports SNP allele frequencies to help
-#' decide whether phasing is feasible. Mutation calling is performed separately
-#' by \code{\link{flag_snv}}.
+#' Processes output from \code{\link{detect_snv}}, performs UMI error correction
+#' using Levenshtein distance, and creates per-cell barcode summaries with read
+#' counts. Does NOT perform mutation calling -- use \code{\link{flag_snv}} for
+#' mutation calling with thresholds.
 #'
-#' @param session_name Prefix used for output files.
-#' @param path_snv_table Path to the CSV written by \code{\link{detect_snv}}.
-#' @param path_barcodes Path to a cell barcode whitelist (\code{.csv} or plain
-#'   text); a trailing \code{-1} 10x suffix is handled automatically.
-#' @param path_output_folder Existing directory for output files.
-#' @param umi_mismatch Maximum edit distance for UMI correction (default: 2).
-#' @param n_cores Number of CPU cores (default: 4).
-#' @param skip_plots Skip diagnostic plot generation (default: FALSE).
+#' @param session_name Character. Prefix for output files.
+#' @param path_snv_table Character. Path to CSV output from \code{\link{detect_snv}}.
+#' @param path_barcodes Character. Path to cell barcode whitelist (.csv or text file).
+#' @param path_output_folder Character. Path to output directory for results.
+#' @param umi_mismatch Integer. Maximum edit distance (Levenshtein) for UMI
+#'   error correction. UMIs within this distance are collapsed to the most
+#'   abundant sequence. Default: 2.
+#' @param n_cores Integer. Number of CPU cores to use. Will be capped at
+#'   \code{parallel::detectCores() - 1}. Default: 4.
+#' @param skip_plots Logical. If \code{TRUE}, skip diagnostic plot generation.
+#'   Default: \code{FALSE}.
 #'
-#' @return Invisibly, a list with:
-#'   \itemize{
-#'     \item \code{summary} -- per-cell UMI counts (input for \code{flag_snv()}).
-#'     \item \code{umi_frequencies} -- reads per UMI, ranked, for thresholding.
-#'     \item \code{knee_points} -- detected knee/inflection thresholds.
-#'     \item \code{snp_frequencies}, \code{phasing_viable}, \code{phasing_message},
-#'       \code{has_minor_roi} -- phasing assessment.
-#'     \item \code{statistics} -- QC counts.
-#'   }
+#' @return Invisibly returns a list with:
+#' \describe{
+#'   \item{summary}{data.table with per-CBC UMI counts (input for \code{flag_snv})}
+#'   \item{umi_frequencies}{data.table with UMI read counts for thresholding}
+#'   \item{knee_points}{List of detected knee/elbow/inflection points}
+#'   \item{snp_frequencies}{List with major/minor ROI frequency tables}
+#'   \item{phasing_viable}{Logical indicating if SNP phasing is viable}
+#'   \item{phasing_message}{Character describing phasing assessment}
+#'   \item{has_minor_roi}{Logical indicating if minor ROI data was found}
+#'   \item{statistics}{List with QC statistics (n_input, n_valid, n_filtered, etc.)}
+#' }
 #'
 #' @details
-#' The per-cell summary CSV is semicolon-separated with columns
-#' \code{cbc;umis;n_umi;n_umi_mut;n_umi_wt;n_snp;n_snp_mut;n_snp_wt}, where the
-#' count columns are comma-separated per corrected UMI. This is the expected
-#' input for \code{\link{flag_snv}}.
+#' The output CSV uses semicolon (\code{;}) as separator with columns:
+#' \code{cbc;umis;n_umi;n_umi_mut;n_umi_wt;n_snp;n_snp_mut;n_snp_wt}.
+#' The \code{n_umi_mut} and \code{n_umi_wt} fields contain comma-separated
+#' read counts per UMI.
 #'
-#' @seealso \code{\link{detect_snv}}, \code{\link{flag_snv}}
+#' This output is designed as input for \code{\link{flag_snv}} which performs
+#' mutation calling with customizable thresholds.
+#'
+#' @examples
+#' \dontrun{
+#' result <- summarize_snv(
+#'   session_name = "EXP28",
+#'   path_snv_table = "output/EXP28_snv_table.csv",
+#'   path_barcodes = "barcodes/iPSC_final_barcodes.csv",
+#'   path_output_folder = "output/",
+#'   umi_mismatch = 2L,
+#'   n_cores = 4L
+#' )
+#'
+#' # View knee points for threshold selection
+#' result$knee_points
+#'
+#' # Check phasing viability
+#' message(result$phasing_message)
+#' }
+#'
 #' @export
 summarize_snv <- function(session_name,
                           path_snv_table,
@@ -814,33 +1065,45 @@ summarize_snv <- function(session_name,
                           umi_mismatch = 2L,
                           n_cores = 4L,
                           skip_plots = FALSE) {
-    # --- Input validation ---
+    # =========================================================================
+    # INPUT VALIDATION
+    # =========================================================================
+
     stopifnot("`session_name` must be character" = is.character(session_name))
     stopifnot("`path_snv_table` not found" = file.exists(path_snv_table))
     stopifnot("`path_barcodes` not found" = file.exists(path_barcodes))
     stopifnot("`path_output_folder` not found" = dir.exists(path_output_folder))
 
-    # Never request more than (available - 1) cores.
+    # Adjust cores
     available_cores <- parallel::detectCores()
     if (n_cores > available_cores - 1L) {
         n_cores <- max(1L, available_cores - 1L)
         message("n_cores adjusted to ", n_cores)
     }
 
-    # --- Load the detect_snv() table ---
-    message(Sys.time(), " - Loading SNV table: ", path_snv_table)
-    dt_input <- fread(path_snv_table, header = TRUE)
-    print(colnames(dt_input))
-    n_input <- nrow(dt_input)
-    message("  Loaded ", format(n_input, big.mark = ","), " reads")
+    # =========================================================================
+    # LOAD DATA
+    # =========================================================================
 
-    req_cols <- c("CBC", "UMI", "major_base", "major_status")
-    missing <- setdiff(req_cols, colnames(dt_input))
+    message(Sys.time(), " - Loading SNV table: ", path_snv_table)
+
+    # Only load columns needed for summarization (not the full enriched table)
+    all_cols <- names(fread(path_snv_table, nrows = 0))
+    req_cols <- c("read_id", "CBC", "UMI", "major_base", "major_status")
+    opt_cols <- c("minor_status")
+    select_cols <- intersect(c(req_cols, opt_cols), all_cols)
+
+    missing <- setdiff(req_cols, all_cols)
     if (length(missing) > 0) {
         stop("Missing required columns: ", paste(missing, collapse = ", "))
     }
 
-    # Minor-ROI (phasing) data is optional; only use it if actually populated.
+    dt_input <- fread(path_snv_table, select = select_cols)
+    n_input <- nrow(dt_input)
+    message("  Loaded ", format(n_input, big.mark = ","), " reads (",
+            length(select_cols), " of ", length(all_cols), " columns)")
+
+    # Check for minor ROI (phasing data)
     has_minor <- "minor_status" %in% colnames(dt_input)
     if (has_minor) {
         valid_minor <- !is.na(dt_input$minor_status) &
@@ -852,41 +1115,50 @@ summarize_snv <- function(session_name,
         }
     }
 
-    # --- Restrict to whitelisted barcodes with a valid major call ---
+    # =========================================================================
+    # FILTER BY BARCODES
+    # =========================================================================
+
     message(Sys.time(), " - Loading barcode whitelist")
 
-    # Accept either a .csv or a plain-text list of barcodes.
+    # Handle both .csv and plain text formats
     if (grepl("\\.csv$", path_barcodes, ignore.case = TRUE)) {
         bc_raw <- fread(path_barcodes, header = FALSE)[[1]]
     } else {
         bc_raw <- readLines(path_barcodes)
     }
 
-    # Use the first 16 bp so a 10x "-1" suffix does not break matching.
+    # Extract 16bp barcode (handle -1 suffix from 10x)
     bc_16 <- substr(bc_raw, 1, 16)
     message("  Loaded ", length(bc_16), " barcodes")
 
-    # Keep only reads with a definite MUT/WT major call.
+    # Filter by valid major status and drop the full input table
     dt_valid <- dt_input[major_status %in% c("MUT", "WT")]
     n_valid <- nrow(dt_valid)
+    rm(dt_input)
+    gc(verbose = FALSE)
     message("  Valid major ROI calls: ", .fmt_pct(n_valid, n_input))
 
-    # Keep only reads whose barcode is in the whitelist.
+    # Filter by barcode whitelist
     setkey(dt_valid, CBC)
     dt_valid <- dt_valid[CBC %in% bc_16]
     n_filtered <- nrow(dt_valid)
     message("  After barcode filter: ", .fmt_pct(n_filtered, n_valid))
     message("  Unique CBCs: ", uniqueN(dt_valid$CBC))
 
-    # --- UMI correction, one cell barcode at a time ---
+    # =========================================================================
+    # UMI CORRECTION
+    # =========================================================================
+
     message(Sys.time(), " - Performing UMI correction (max mismatch = ", umi_mismatch, ")")
 
-    # Trim to the columns we need and rename UMI -> initial_UMI.
+    # Keep essential columns only
     cols_keep <- c("read_id", "CBC", "UMI", "major_status")
     if (has_minor) cols_keep <- c(cols_keep, "minor_status")
     dt_valid <- dt_valid[, ..cols_keep]
     setnames(dt_valid, "UMI", "initial_UMI")
 
+    # Update cols_keep to reflect renamed column
     cols_keep[cols_keep == "UMI"] <- "initial_UMI"
 
     n_cbcs <- uniqueN(dt_valid$CBC)
@@ -897,7 +1169,7 @@ summarize_snv <- function(session_name,
             n_corrected_umis <- uniqueN(result$corrected_UMI)
             n_collapsed <- n_initial_umis - n_corrected_umis
 
-            if (n_collapsed > 10) { # only log the sizeable corrections
+            if (n_collapsed > 10) { # Log only significant corrections
                 message(sprintf(
                     "  CBC %d/%d - %d reads | UMIs: %d initial -> %d corrected (%d collapsed, %d%% reduction)",
                     .GRP, n_cbcs, nrow(result),
@@ -915,18 +1187,21 @@ summarize_snv <- function(session_name,
     n_corrected <- sum(dt_corrected$corrected)
     message("  UMIs corrected: ", .fmt_pct(n_corrected, nrow(dt_corrected)))
 
-    rm(dt_valid, dt_input)
+    rm(dt_valid) # dt_input was already dropped after filtering
     gc(verbose = FALSE)
 
-    # --- Reads-per-UMI distribution and knee detection ---
+    # =========================================================================
+    # COMPUTE UMI FREQUENCIES & KNEE POINTS
+    # =========================================================================
+
     message(Sys.time(), " - Computing UMI frequencies (reads per UMI)")
 
-    # Reads per corrected UMI (per cell) = the duplication level.
+    # Count reads per UMI (across all cells) - this is the duplication level
     umi_freq <- dt_corrected[, .(
         n_reads = .N
     ), by = .(CBC, corrected_UMI)]
 
-    # Rank UMIs from most to least sequenced.
+    # Sort by reads per UMI (descending) and rank
     setorder(umi_freq, -n_reads)
     umi_freq[, rank := .I]
 
@@ -934,6 +1209,7 @@ summarize_snv <- function(session_name,
     message("  Max reads per UMI: ", max(umi_freq$n_reads))
     message("  Median reads per UMI: ", median(umi_freq$n_reads))
 
+    # Detect knee points on reads per UMI distribution
     message(Sys.time(), " - Detecting knee/elbow/inflection points")
     knee_points <- .detect_knee_points(umi_freq$rank, umi_freq$n_reads)
 
@@ -943,24 +1219,29 @@ summarize_snv <- function(session_name,
     if (is.finite(knee_points$lower_knee)) message("  Lower Knee (curve flattens): ", knee_points$lower_knee, " reads")
     if (is.finite(knee_points$uik)) message("  UIK (Unit Invariant Knee): ", knee_points$uik, " reads")
     if (is.finite(knee_points$cellranger)) message("  CellRanger-style (m/10): ", knee_points$cellranger, " reads")
+    if (is.finite(knee_points$otsu)) message("  Otsu (inter-class variance): ", knee_points$otsu, " reads")
+    if (is.finite(knee_points$mixture)) message("  Mixture model (EM intersection): ", knee_points$mixture, " reads")
     if (is.finite(knee_points$lower)) {
         message("  Suggested threshold range: ", knee_points$lower, " - ", knee_points$upper, " reads per UMI")
     }
     message("")
 
-    # (Plots are drawn later, once dt_umi_counts exists for the 4th panel.)
+    # Note: Plots generated after dt_umi_counts is created (needed for 4th plot)
 
-    # --- Per-UMI MUT/WT (and minor) counts ---
+    # =========================================================================
+    # SUMMARIZE PER CBC + UMI
+    # =========================================================================
+
     message(Sys.time(), " - Summarizing reads per UMI")
 
-    # Count MUT vs WT reads for each corrected UMI.
+    # Count MUT vs WT reads per corrected UMI
     dt_umi_counts <- dt_corrected[, .(
         n_mut = sum(major_status == "MUT"),
         n_wt = sum(major_status == "WT"),
         n_total = .N
     ), by = .(CBC, corrected_UMI)]
 
-    # Attach minor-ROI counts when phasing data is available.
+    # Add minor ROI counts if present
     if (has_minor) {
         dt_minor <- dt_corrected[!is.na(minor_status) & minor_status %in% c("MUT", "WT")]
 
@@ -982,15 +1263,15 @@ summarize_snv <- function(session_name,
         dt_umi_counts[, `:=`(n_minor_mut = 0L, n_minor_wt = 0L)]
     }
 
-    # Now that per-UMI counts exist, draw the diagnostic plots.
+    # Generate diagnostic plots (moved here so dt_umi_counts is available for 4th plot)
     if (!skip_plots) {
         .plot_umi_distribution(umi_freq, knee_points, path_output_folder, session_name, dt_umi_counts)
     }
 
-    # Order UMIs within each cell from most to least abundant.
+    # Sort by abundance within each CBC
     setorder(dt_umi_counts, CBC, -n_total)
 
-    # Collapse each cell's UMIs into comma-separated strings (one row per cell).
+    # Collapse to comma-separated strings per CBC
     dt_summary <- dt_umi_counts[, .(
         umis = paste(corrected_UMI, collapse = ","),
         n_umi = paste(n_total, collapse = ","),
@@ -1005,39 +1286,61 @@ summarize_snv <- function(session_name,
 
     message("  Summary created for ", nrow(dt_summary), " cell barcodes")
 
-    # --- Write outputs ---
+    # =========================================================================
+    # SAVE OUTPUTS
+    # =========================================================================
+
     message(Sys.time(), " - Saving outputs")
 
-    # Per-cell summary (semicolon-separated) = input for flag_snv().
+    # UMI summary (semicolon-separated - input for flag_snv)
     out_summary <- file.path(path_output_folder, paste0(session_name, "_snv_summary.csv"))
     fwrite(dt_summary, out_summary, sep = ";")
     message("  ", out_summary)
 
-    # Ranked reads-per-UMI table (for choosing a threshold).
+    # UMI frequencies (for thresholding decisions)
     out_freq <- file.path(path_output_folder, paste0(session_name, "_umi_frequencies.csv"))
     fwrite(umi_freq, out_freq)
     message("  ", out_freq)
 
-    # --- SNP frequency tables + phasing assessment ---
+    # Knee/threshold points
+    knee_dt <- data.table(
+        method = c("upper_knee", "inflection", "lower_knee", "uik",
+                   "cellranger", "otsu", "mixture", "range_lower", "range_upper"),
+        threshold = c(knee_points$upper_knee, knee_points$inflection,
+                      knee_points$lower_knee, knee_points$uik,
+                      knee_points$cellranger, knee_points$otsu,
+                      knee_points$mixture, knee_points$lower, knee_points$upper)
+    )
+    out_knee <- file.path(path_output_folder, paste0(session_name, "_thresholds.csv"))
+    fwrite(knee_dt, out_knee)
+    message("  ", out_knee)
+
+    # =========================================================================
+    # CREATE AND SAVE SNP FREQUENCY TABLES
+    # =========================================================================
+
     message(Sys.time(), " - Creating SNP frequency tables")
 
     snp_freq_tables <- .create_snp_frequency_tables(dt_corrected, has_minor)
 
+    # Save major ROI frequency table
     out_major_freq <- file.path(path_output_folder, paste0(session_name, "_major_roi_frequency.csv"))
     fwrite(snp_freq_tables$major_freq, out_major_freq)
     message("  ", out_major_freq)
 
+    # Save minor ROI frequency table if present
     if (!is.null(snp_freq_tables$minor_freq)) {
         out_minor_freq <- file.path(path_output_folder, paste0(session_name, "_minor_roi_frequency.csv"))
         fwrite(snp_freq_tables$minor_freq, out_minor_freq)
         message("  ", out_minor_freq)
     }
 
+    # Save combined frequency table
     out_combined_freq <- file.path(path_output_folder, paste0(session_name, "_snp_frequency_combined.csv"))
     fwrite(snp_freq_tables$combined, out_combined_freq)
     message("  ", out_combined_freq)
 
-    # Report the phasing assessment to the console.
+    # Print phasing assessment
     message("\n  === SNP Frequency Summary ===")
     message("  Major ROI:")
     print(snp_freq_tables$major_freq[, .(status, n_reads, pct_reads, n_umis, pct_umis)])
@@ -1049,7 +1352,10 @@ summarize_snv <- function(session_name,
 
     message("\n  ", snp_freq_tables$phasing_message)
 
-    # --- Return ---
+    # =========================================================================
+    # RETURN RESULTS
+    # =========================================================================
+
     message("\n=== Summarization Complete ===")
     message("Input reads: ", format(n_input, big.mark = ","))
     message("Valid reads: ", format(n_filtered, big.mark = ","))

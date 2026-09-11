@@ -2,7 +2,7 @@
 % Please edit documentation in R/flag_snv.R
 \name{flag_snv}
 \alias{flag_snv}
-\title{Flag SNV mutation status per cell at a chosen threshold}
+\title{Flag SNV Mutation Status from UMI Summary}
 \usage{
 flag_snv(
   path_snv_summary,
@@ -18,47 +18,88 @@ flag_snv(
 )
 }
 \arguments{
-\item{path_snv_summary}{Path to the summary CSV from \code{\link{summarize_snv}},
-or the \code{data.table} returned as \code{summarize_snv()$summary}.}
+\item{path_snv_summary}{Path to SNV summary CSV from \code{summarize_snv()} OR
+a \code{data.table} returned by \code{summarize_snv()$summary}.}
 
-\item{path_barcodes}{Optional full barcode whitelist used to backfill missing
-cells so every expected barcode appears in the output.}
+\item{path_barcodes}{Path to full barcode whitelist (optional). Used for
+backfilling missing cells so that all expected barcodes appear in output.}
 
-\item{path_barcode_filter}{Optional whitelist; when supplied, ONLY these
-barcodes are analysed.}
+\item{path_barcode_filter}{Path to barcode whitelist for filtering (optional).
+When provided, ONLY these barcodes will be analyzed.}
 
-\item{path_output_folder}{Optional output directory; if \code{NULL}, nothing
-is written to disk.}
+\item{path_output_folder}{Path for output files. If \code{NULL}, no files
+are written.}
 
 \item{session_name}{Prefix for output files (default: \code{"snv_flags"}).}
 
-\item{threshold}{Minimum total reads per UMI to consider (default: 10).}
+\item{threshold}{Minimum TOTAL reads per UMI to consider (default: 10).}
 
-\item{consensus_threshold}{Fraction of reads a UMI must lean to be called
-(default: 0.8).}
+\item{consensus_threshold}{Fraction of reads for UMI consensus (default: 0.8).
+UMIs must lean >= this fraction to one side to be called MUT or WT.}
 
-\item{use_phasing}{Use minor-SNP data for definitive/ambiguous calls
-(default: FALSE).}
+\item{use_phasing}{Logical; use SNP data for definitive/ambiguous calls
+(default: \code{FALSE}).}
 
-\item{minor_percentage}{Minimum fraction of minor reads relative to major
-reads (default: 0.2).}
+\item{minor_percentage}{Minimum fraction of minor reads relative to major reads
+(default: 0.2).}
 
-\item{minor_on_major}{Expected minor allele on the major allele, \code{"MUT"}
-or \code{"WT"} (default: \code{"MUT"}).}
+\item{minor_on_major}{Expected minor allele status on major allele
+(\code{"MUT"} or \code{"WT"}, default: \code{"MUT"}).}
 }
 \value{
-A \code{data.table} with one row per cell barcode and columns
-\code{cbc}, \code{barcode_10x}, \code{has_np_data}, \code{mutation_call},
-\code{major_call_simple}, \code{phased_call} and \code{phased_call_simple}.
+A \code{data.table} with columns:
+\describe{
+\item{cbc}{Cell barcode (16-mer)}
+\item{barcode_10x}{Cell barcode with \code{-1} suffix for 10x compatibility}
+\item{has_np_data}{Logical; whether the cell had Nanopore data}
+\item{mutation_call}{Major mutation call: MUT, WT, MUT_WT, below_threshold, or no_np_data}
+\item{major_call_simple}{Simplified major call: MUT, WT, or NA}
+\item{phased_call}{Detailed phased call (e.g., MUT_mnsnp, def_WT, amb_WT)}
+\item{phased_call_simple}{Simplified phased call: MUT, defWT, ambWT, or NA}
+}
 }
 \description{
-Classifies each cell barcode from the per-cell UMI summary produced by
-\code{\link{summarize_snv}}. UMIs are filtered by total read count, flagged
-MUT/WT by strict consensus, and aggregated into a major call
-(\code{MUT}/\code{WT}/\code{MUT_WT}). With \code{use_phasing = TRUE}, a minor
-SNP ROI is used to split wild-type cells into definitive vs. ambiguous and to
-validate mutant calls.
+Flags mutation status (MUT/WT) for each cell barcode based on UMI summary
+from \code{\link{summarize_snv}}. Uses total read count filtering per UMI
+and strict consensus thresholds. Optionally supports SNP phasing for
+definitive vs. ambiguous wild-type classification.
 }
-\seealso{
-\code{\link{detect_snv}}, \code{\link{summarize_snv}}
+\details{
+The function applies a multi-level calling strategy:
+\enumerate{
+\item Filter UMIs by total read count (mut + wt) >= threshold
+\item Flag UMIs as MUT/WT based on consensus (default 80\\%)
+\item Assign cell-level major call: MUT, WT, or MUT_WT (heterozygous)
+\item Optionally assign phased call using minor SNP data
+}
+}
+\examples{
+\dontrun{
+# Basic usage with file path
+flags <- flag_snv(
+  path_snv_summary = "snv_summary.csv",
+  threshold = 10,
+  consensus_threshold = 0.8
+)
+
+# With phasing enabled
+flags <- flag_snv(
+  path_snv_summary = "snv_summary.csv",
+  path_barcodes = "barcodes.csv",
+  path_output_folder = "output/",
+  session_name = "experiment1",
+  threshold = 10,
+  use_phasing = TRUE,
+  minor_percentage = 0.2,
+  minor_on_major = "MUT"
+)
+
+# Using data.table input from summarize_snv()
+summary_result <- summarize_snv(...)
+flags <- flag_snv(
+  path_snv_summary = summary_result$summary,
+  threshold = 5
+)
+}
+
 }

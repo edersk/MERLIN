@@ -39,7 +39,7 @@ Useful links:
 
 }
 \author{
-\strong{Maintainer}: Sebastian Eder \email{sebastian.eder@example.com} (\href{https://orcid.org/YOUR-ORCID-ID}{ORCID})
+\strong{Maintainer}: Sebastian Eder \email{edersk.merlin@gmail.com}
 
 }
 \keyword{internal}

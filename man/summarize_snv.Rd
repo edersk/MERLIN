@@ -2,7 +2,7 @@
 % Please edit documentation in R/summarize_snv.R
 \name{summarize_snv}
 \alias{summarize_snv}
-\title{Summarize SNV detection results (UMI correction, no calling)}
+\title{Summarize SNV Detection Results}
 \usage{
 summarize_snv(
   session_name,
@@ -15,46 +15,68 @@ summarize_snv(
 )
 }
 \arguments{
-\item{session_name}{Prefix used for output files.}
+\item{session_name}{Character. Prefix for output files.}
 
-\item{path_snv_table}{Path to the CSV written by \code{\link{detect_snv}}.}
+\item{path_snv_table}{Character. Path to CSV output from \code{\link{detect_snv}}.}
 
-\item{path_barcodes}{Path to a cell barcode whitelist (\code{.csv} or plain
-text); a trailing \code{-1} 10x suffix is handled automatically.}
+\item{path_barcodes}{Character. Path to cell barcode whitelist (.csv or text file).}
 
-\item{path_output_folder}{Existing directory for output files.}
+\item{path_output_folder}{Character. Path to output directory for results.}
 
-\item{umi_mismatch}{Maximum edit distance for UMI correction (default: 2).}
+\item{umi_mismatch}{Integer. Maximum edit distance (Levenshtein) for UMI
+error correction. UMIs within this distance are collapsed to the most
+abundant sequence. Default: 2.}
 
-\item{n_cores}{Number of CPU cores (default: 4).}
+\item{n_cores}{Integer. Number of CPU cores to use. Will be capped at
+\code{parallel::detectCores() - 1}. Default: 4.}
 
-\item{skip_plots}{Skip diagnostic plot generation (default: FALSE).}
+\item{skip_plots}{Logical. If \code{TRUE}, skip diagnostic plot generation.
+Default: \code{FALSE}.}
 }
 \value{
-Invisibly, a list with:
-\itemize{
-\item \code{summary} -- per-cell UMI counts (input for \code{flag_snv()}).
-\item \code{umi_frequencies} -- reads per UMI, ranked, for thresholding.
-\item \code{knee_points} -- detected knee/inflection thresholds.
-\item \code{snp_frequencies}, \code{phasing_viable}, \code{phasing_message},
-\code{has_minor_roi} -- phasing assessment.
-\item \code{statistics} -- QC counts.
+Invisibly returns a list with:
+\describe{
+\item{summary}{data.table with per-CBC UMI counts (input for \code{flag_snv})}
+\item{umi_frequencies}{data.table with UMI read counts for thresholding}
+\item{knee_points}{List of detected knee/elbow/inflection points}
+\item{snp_frequencies}{List with major/minor ROI frequency tables}
+\item{phasing_viable}{Logical indicating if SNP phasing is viable}
+\item{phasing_message}{Character describing phasing assessment}
+\item{has_minor_roi}{Logical indicating if minor ROI data was found}
+\item{statistics}{List with QC statistics (n_input, n_valid, n_filtered, etc.)}
 }
 }
 \description{
-Processes the per-read table from \code{\link{detect_snv}}, corrects UMIs
-within each cell barcode using Levenshtein distance, and produces a per-cell
-summary of reads per corrected UMI. It also detects knee/inflection thresholds
-on the reads-per-UMI distribution and reports SNP allele frequencies to help
-decide whether phasing is feasible. Mutation calling is performed separately
-by \code{\link{flag_snv}}.
+Processes output from \code{\link{detect_snv}}, performs UMI error correction
+using Levenshtein distance, and creates per-cell barcode summaries with read
+counts. Does NOT perform mutation calling -- use \code{\link{flag_snv}} for
+mutation calling with thresholds.
 }
 \details{
-The per-cell summary CSV is semicolon-separated with columns
-\code{cbc;umis;n_umi;n_umi_mut;n_umi_wt;n_snp;n_snp_mut;n_snp_wt}, where the
-count columns are comma-separated per corrected UMI. This is the expected
-input for \code{\link{flag_snv}}.
+The output CSV uses semicolon (\code{;}) as separator with columns:
+\code{cbc;umis;n_umi;n_umi_mut;n_umi_wt;n_snp;n_snp_mut;n_snp_wt}.
+The \code{n_umi_mut} and \code{n_umi_wt} fields contain comma-separated
+read counts per UMI.
+
+This output is designed as input for \code{\link{flag_snv}} which performs
+mutation calling with customizable thresholds.
 }
-\seealso{
-\code{\link{detect_snv}}, \code{\link{flag_snv}}
+\examples{
+\dontrun{
+result <- summarize_snv(
+  session_name = "EXP28",
+  path_snv_table = "output/EXP28_snv_table.csv",
+  path_barcodes = "barcodes/iPSC_final_barcodes.csv",
+  path_output_folder = "output/",
+  umi_mismatch = 2L,
+  n_cores = 4L
+)
+
+# View knee points for threshold selection
+result$knee_points
+
+# Check phasing viability
+message(result$phasing_message)
+}
+
 }
