@@ -189,8 +189,8 @@ library(data.table)
         type = "global", gapOpening = 5, gapExtension = 2)
       
       # Find N position in aligned reference (within padded alignment)
-      aligned_ref_str <- as.character(Biostrings::subject(aln))
-      aligned_pat_str <- as.character(Biostrings::pattern(aln))
+      aligned_ref_str <- as.character(pwalign::alignedSubject(aln))
+      aligned_pat_str <- as.character(pwalign::alignedPattern(aln))
       n_pos <- regexpr("N", aligned_ref_str, fixed = TRUE)[1]
       
       if (n_pos > 0 && n_pos <= nchar(aligned_pat_str)) {
